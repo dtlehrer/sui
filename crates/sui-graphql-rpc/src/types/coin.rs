@@ -1,13 +1,14 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::data::{Db, QueryExecutor};
+use crate::data::{Db, RawQueryBuilder};
 use crate::error::Error;
+use crate::filter;
 
 use super::balance::{self, Balance};
 use super::base64::Base64;
 use super::big_int::BigInt;
-use super::cursor::{Page, Target};
+use super::cursor::Page;
 use super::display::DisplayEntry;
 use super::dynamic_field::{DynamicField, DynamicFieldName};
 use super::move_object::{MoveObject, MoveObjectImpl};
@@ -21,10 +22,7 @@ use super::transaction_block::{self, TransactionBlock, TransactionBlockFilter};
 use super::type_filter::ExactTypeFilter;
 use async_graphql::*;
 
-use async_graphql::connection::{Connection, CursorType, Edge};
-use diesel::{ExpressionMethods, QueryDsl};
-use sui_indexer::models_v2::objects::StoredObject;
-use sui_indexer::schema_v2::objects;
+use async_graphql::connection::Connection;
 use sui_indexer::types_v2::OwnerType;
 use sui_types::coin::Coin as NativeCoin;
 use sui_types::TypeTag;
@@ -292,48 +290,50 @@ impl Coin {
         owner: Option<SuiAddress>,
         checkpoint_sequence_number: Option<u64>,
     ) -> Result<Connection<String, Coin>, Error> {
-        let (prev, next, results) = db
-            .execute(move |conn| {
-                page.paginate_query::<StoredObject, _, _, _>(conn, move || {
-                    use objects::dsl;
-                    let mut query = dsl::objects.into_boxed();
+        Object::paginate_subtype(
+            db,
+            page,
+            checkpoint_sequence_number,
+            move |query| Self::filter(query, coin_type.clone(), owner),
+            |object| {
+                let address = object.address;
+                let move_object = MoveObject::try_from(&object).map_err(|_| {
+                    Error::Internal(format!(
+                        "Expected {address} to be a Coin, but it's not a Move Object.",
+                    ))
+                })?;
 
-                    query = query.filter(
-                        dsl::coin_type.eq(coin_type.to_canonical_string(/* with_prefix */ true)),
-                    );
-
-                    if let Some(owner) = &owner {
-                        // Leverage index on objects table
-                        query = query.filter(dsl::owner_type.eq(OwnerType::Address as i16));
-                        query = query.filter(dsl::owner_id.eq(owner.into_vec()));
-                    }
-
-                    query
+                Coin::try_from(&move_object).map_err(|_| {
+                    Error::Internal(format!("Expected {address} to be a Coin, but it is not."))
                 })
-            })
-            .await?;
+            },
+        )
+        .await
+    }
 
-        let mut conn = Connection::new(prev, next);
-
-        for stored in results {
-            let cursor = stored.cursor().encode_cursor();
-            let object = Object::try_from_stored_object(stored, checkpoint_sequence_number)?;
-
-            let move_ = MoveObject::try_from(&object).map_err(|_| {
-                Error::Internal(format!(
-                    "Failed to deserialize as Move object: {}",
-                    object.address
-                ))
-            })?;
-
-            let coin = Coin::try_from(&move_).map_err(|_| {
-                Error::Internal(format!("Faild to deserialize as Coin: {}", object.address))
-            })?;
-
-            conn.edges.push(Edge::new(cursor, coin));
+    pub(crate) fn filter(
+        mut query: RawQueryBuilder,
+        coin_type: TypeTag,
+        owner: Option<SuiAddress>,
+    ) -> RawQueryBuilder {
+        if let Some(owner) = owner {
+            query = filter!(
+                query,
+                format!(
+                    "owner_id = '\\x{}'::bytea AND owner_type = {}",
+                    hex::encode(owner.into_vec()),
+                    OwnerType::Address as i16
+                )
+            );
         }
 
-        Ok(conn)
+        query = filter!(
+            query,
+            "coin_type IS NOT NULL AND coin_type = {}",
+            coin_type.to_canonical_display(/* with_prefix */ true)
+        );
+
+        query
     }
 }
 
